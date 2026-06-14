@@ -135,31 +135,74 @@ function App() {
     return code.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\').replace(/\\"/g, '"');
   };
 
-  const callGemini = async (prompt: string): Promise<Record<string, unknown>> => {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json' },
-        }),
-      }
-    );
-    if (!response.ok) throw new Error(`Gemini API Error: Status ${response.status}`);
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  const groqKey = import.meta.env.VITE_GROQ_API_KEY as string || '';
+
+  const callGroq = async (prompt: string): Promise<Record<string, unknown>> => {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${groqKey}`,
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+      }),
+    });
+    if (!response.ok) throw new Error(`Groq API Error: Status ${response.status}`);
     const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const text = data.choices?.[0]?.message?.content || '';
     const cleanJsonStr = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleanJsonStr) as Record<string, unknown>;
+  };
+
+  const callGeminiWithFallback = async (prompt: string): Promise<Record<string, unknown>> => {
     try {
-      return JSON.parse(cleanJsonStr) as Record<string, unknown>;
-    } catch {
-      const firstBrace = cleanJsonStr.indexOf('{');
-      const lastBrace = cleanJsonStr.lastIndexOf('}');
-      if (firstBrace !== -1 && lastBrace > firstBrace) {
-        return JSON.parse(cleanJsonStr.slice(firstBrace, lastBrace + 1)) as Record<string, unknown>;
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: 'application/json' },
+          }),
+        }
+      );
+      if (response.status === 429 && groqKey) {
+        console.log('Gemini rate limited. Switching to Groq...');
+        await sleep(1000);
+        return await callGroq(prompt);
       }
-      throw new Error('Could not parse JSON from Gemini response');
+      if (!response.ok) throw new Error(`Gemini API Error: Status ${response.status}`);
+      const data = await response.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const cleanJsonStr = text.replace(/```json/g, '').replace(/```/g, '').trim();
+      return JSON.parse(cleanJsonStr) as Record<string, unknown>;
+    } catch (e: unknown) {
+      if (groqKey && !(e instanceof Error && e.message.includes('Could not parse'))) {
+        console.log('Gemini failed. Trying Groq...');
+        await sleep(1000);
+        return await callGroq(prompt);
+      }
+      throw e;
+    }
+  };
+
+  const callGemini = async (prompt: string): Promise<Record<string, unknown>> => {
+    try {
+      return await callGeminiWithFallback(prompt);
+    } catch {
+      if (groqKey) {
+        console.log('Both providers failed. Retrying Groq...');
+        await sleep(3000);
+        return await callGroq(prompt);
+      }
+      throw new Error('All API providers failed');
     }
   };
 
@@ -221,7 +264,7 @@ function App() {
         }
         setEditorCode(devCode);
         appendLog('developer', '💻 Developer Agent: Code generation complete. Output sent to workspace.', 3000);
-        await new Promise((r) => setTimeout(r, 1200));
+        await new Promise((r) => setTimeout(r, 3000));
       } else {
         appendLog('system', '📝 User-supplied code loaded. Skipping Developer Agent code generation.', 800);
         await new Promise((r) => setTimeout(r, 1200));
@@ -261,7 +304,7 @@ function App() {
       // ===================== AGENT 3: PATCHER =====================
       setScanStatus('patching');
       appendLog('system', "📥 Handing off Auditor Agent's findings to Auto-Patcher Agent...", 5700);
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 3000));
       appendLog('patcher', '🛠️ Patcher Agent activated. Generating remediated codebase...', 6500);
 
       if (vulnerabilities.length > 0) {
@@ -429,19 +472,40 @@ function App() {
     setChatInput('');
     setChatMessages((prev) => [...prev, { role: 'user', text: userMsg }]);
     setIsChatLoading(true);
+    const systemPrompt = `You are PatchForge's security expert. Analyzed code:\n\n${prScenario.vulnerableCode}\n\nFound: ${prScenario.cwe} (${prScenario.severity})\nPatched by: ${prScenario.explanation}\n\nUser asks: "${userMsg}"\n\nAnswer concisely, referencing the code.`;
+
     try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ parts: [{ text: `You are PatchForge's security expert. Analyzed code:\n\n${prScenario.vulnerableCode}\n\nFound: ${prScenario.cwe} (${prScenario.severity})\nPatched by: ${prScenario.explanation}\n\nUser asks: "${userMsg}"\n\nAnswer concisely, referencing the code.` }] }] }),
+      let reply = '';
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contents: [{ parts: [{ text: systemPrompt }] }] }),
+          }
+        );
+        if (res.ok) {
+          const data = await res.json();
+          reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         }
-      );
-      const data = await res.json();
-      setChatMessages((prev) => [...prev, { role: 'ai', text: data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response.' }]);
+      } catch { /* Gemini failed, try Groq */ }
+
+      if (!reply && groqKey) {
+        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+          body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: systemPrompt }], temperature: 0.3 }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          reply = data.choices?.[0]?.message?.content || '';
+        }
+      }
+
+      setChatMessages((prev) => [...prev, { role: 'ai', text: reply || 'No response.' }]);
     } catch {
-      setChatMessages((prev) => [...prev, { role: 'ai', text: 'Error reaching Gemini.' }]);
+      setChatMessages((prev) => [...prev, { role: 'ai', text: 'Error reaching API.' }]);
     } finally {
       setIsChatLoading(false);
     }
